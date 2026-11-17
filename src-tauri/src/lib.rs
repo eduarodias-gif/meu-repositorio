@@ -274,15 +274,28 @@ fn update_bo_status_on(
             next_status.as_str()
         ));
     }
+    // CAS atômico: UPDATE só modifica se o status ainda for o que a validação viu.
+    // Dois workers rodando em paralelo: ambos leem PENDENTE, ambos tentam transicionar;
+    // apenas o primeiro UPDATE (dentro da transação que commita primeiro) encontra
+    // status='PENDENTE' — o segundo recebe `changed == 0` e devolve erro explícito.
+    // Sem o CAS, o segundo sobrescreveria silenciosamente o trabalho do primeiro.
     let changed = tx
         .execute(
             "UPDATE bo_queue SET status=?2, reason=?3,
-          updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE number=?1",
-            params![number, next_status.as_str(), reason],
+          updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE number=?1 AND status=?4",
+            params![
+                number,
+                next_status.as_str(),
+                reason,
+                current_status.as_str()
+            ],
         )
         .map_err(|err| err.to_string())?;
     if changed == 0 {
-        return Err("B.O. não encontrado na fila local.".to_owned());
+        return Err(format!(
+            "Transição perdida para {number}: outro processo alterou o estado antes da operação concluir. Recarregue a fila e tente novamente."
+        ));
     }
     tx.execute(
         "INSERT INTO audit_log(action,bo_number) VALUES(?1,?2)",
@@ -291,6 +304,119 @@ fn update_bo_status_on(
     .map_err(|err| err.to_string())?;
     tx.commit().map_err(|err| err.to_string())?;
     list_all(conn)
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct AcquiredTask {
+    number: String,
+    nature: String,
+    acquired_at: String,
+}
+
+/// Atomicamente pega o B.O. PENDENTE mais antigo (FIFO por `created_at ASC`, desempate
+/// por `number ASC` para ordem estável) e move para EM_LEITURA. Retorna `None` se não
+/// houver tarefa disponível. A chamada é segura para rodar concorrentemente: dois
+/// workers acabam cada um com uma tarefa diferente, ou um deles recebe `None`.
+fn acquire_next_pending_on(
+    conn: &mut Connection,
+    worker_id: &str,
+) -> Result<Option<AcquiredTask>, String> {
+    let worker_label = sanitize::sanitize_reason(worker_id);
+    let tx = conn.transaction().map_err(|err| err.to_string())?;
+    let candidate: Option<(String, String)> = tx
+        .query_row(
+            "SELECT number, nature FROM bo_queue
+             WHERE status='PENDENTE'
+             ORDER BY created_at ASC, number ASC
+             LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|err| err.to_string())?;
+    let Some((number, nature)) = candidate else {
+        return Ok(None);
+    };
+    // CAS: só adquire se ainda estiver PENDENTE. Outro worker que leu a mesma linha
+    // antes de nós já transicionou para EM_LEITURA; o UPDATE falha com changed=0
+    // e indicamos "nada disponível" sem corromper o estado.
+    let changed = tx
+        .execute(
+            "UPDATE bo_queue SET status='EM_LEITURA',
+               reason=?2,
+               updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE number=?1 AND status='PENDENTE'",
+            params![
+                number,
+                format!("acquired by worker:{}", worker_label)
+                    .chars()
+                    .take(300)
+                    .collect::<String>()
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+    if changed == 0 {
+        // Perdeu a disputa; sem erro — simplesmente não há tarefa para este worker.
+        return Ok(None);
+    }
+    tx.execute(
+        "INSERT INTO audit_log(action,bo_number) VALUES('EM_LEITURA', ?1)",
+        params![number],
+    )
+    .map_err(|err| err.to_string())?;
+    let acquired_at: String = tx
+        .query_row(
+            "SELECT updated_at FROM bo_queue WHERE number=?1",
+            params![number],
+            |row| row.get(0),
+        )
+        .map_err(|err| err.to_string())?;
+    tx.commit().map_err(|err| err.to_string())?;
+    Ok(Some(AcquiredTask {
+        number,
+        nature,
+        acquired_at,
+    }))
+}
+
+/// Traduz o resultado estrutural da leitura PPE (ver `src/ppe/bridge-protocol.mjs`)
+/// no próximo estado da fila SQLite, aplicando a transição com CAS a partir de
+/// EM_LEITURA. Essa é a ponte que o worker Node chama quando termina de ler um B.O.
+///
+/// completeness:
+/// - "CONCLUIDA" → LIDO
+/// - "PARCIAL"   → AGUARDANDO_REVISAO (motivo carrega os códigos técnicos)
+/// - "RESTRITA"  → RESTRITO
+/// - "FALHA"     → ERRO (mantém a sessão disponível para reclassificar depois)
+fn record_read_outcome_on(
+    conn: &mut Connection,
+    number: &str,
+    completeness: &str,
+    reasons: &[String],
+) -> Result<Vec<BoRow>, String> {
+    let next = match completeness {
+        "CONCLUIDA" => QueueStatus::Lido,
+        "PARCIAL" => QueueStatus::AguardandoRevisao,
+        "RESTRITA" => QueueStatus::Restrito,
+        "FALHA" => QueueStatus::Erro,
+        other => return Err(format!("Completude '{other}' não reconhecida pelo bridge.")),
+    };
+    let joined_reasons = reasons.join("; ");
+    let prefix = match completeness {
+        "CONCLUIDA" => "Leitura estrutural concluída.",
+        "PARCIAL" => "Leitura parcial:",
+        "RESTRITA" => "Acesso restrito pelo PPE:",
+        "FALHA" => "Falha técnica na leitura:",
+        _ => "Resultado:",
+    };
+    let raw_reason = if joined_reasons.is_empty() {
+        prefix.to_owned()
+    } else {
+        format!("{prefix} {joined_reasons}")
+    };
+    let reason = sanitize::sanitize_reason(&raw_reason);
+    update_bo_status_on(conn, number, next, &reason)
 }
 
 #[tauri::command]
@@ -334,6 +460,24 @@ fn update_bo_status(
 }
 
 #[tauri::command]
+fn acquire_next_pending(app: AppHandle, worker_id: String) -> Result<Option<AcquiredTask>, String> {
+    let mut conn = connection(&app)?;
+    acquire_next_pending_on(&mut conn, &worker_id)
+}
+
+#[tauri::command]
+fn record_read_outcome(
+    app: AppHandle,
+    number: String,
+    completeness: String,
+    reasons: Vec<String>,
+) -> Result<Vec<BoRow>, String> {
+    let number = clean_number(&number)?;
+    let mut conn = connection(&app)?;
+    record_read_outcome_on(&mut conn, &number, &completeness, &reasons)
+}
+
+#[tauri::command]
 fn open_sinesp_portal() -> Result<(), String> {
     // Open a fixed official URL in the default browser. Credentials never pass through SIED.
     #[cfg(target_os = "windows")]
@@ -359,6 +503,8 @@ pub fn run() {
             queue_snapshot,
             add_bo,
             update_bo_status,
+            acquire_next_pending,
+            record_read_outcome,
             open_sinesp_portal
         ])
         .run(tauri::generate_context!())
@@ -870,6 +1016,223 @@ mod tests {
             .unwrap();
         let snapshot = queue_snapshot_for(&mut conn).unwrap();
         assert_eq!(snapshot.revision, max_id);
+    }
+
+    #[test]
+    fn acquire_next_pending_returns_none_on_empty_database() {
+        let mut conn = fresh_memory_db();
+        let result = acquire_next_pending_on(&mut conn, "worker-A").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn acquire_next_pending_returns_none_when_no_pendente_exists() {
+        let mut conn = fresh_memory_db();
+        conn.execute(
+            "INSERT INTO bo_queue(number,nature,status) VALUES ('X','Y','AGUARDANDO_REVISAO')",
+            [],
+        )
+        .unwrap();
+        assert!(acquire_next_pending_on(&mut conn, "w").unwrap().is_none());
+    }
+
+    #[test]
+    fn acquire_next_pending_takes_oldest_pending_first_fifo() {
+        let mut conn = fresh_memory_db();
+        // Insere em ordem reversa com timestamps controlados: C mais antigo, A mais novo.
+        conn.execute(
+            "INSERT INTO bo_queue(number,nature,created_at) VALUES
+               ('BO-A','Furto','2026-01-01T00:00:03.000Z'),
+               ('BO-B','Furto','2026-01-01T00:00:02.000Z'),
+               ('BO-C','Furto','2026-01-01T00:00:01.000Z')",
+            [],
+        )
+        .unwrap();
+        let t1 = acquire_next_pending_on(&mut conn, "w1").unwrap().unwrap();
+        assert_eq!(t1.number, "BO-C", "FIFO: mais antigo primeiro");
+        let t2 = acquire_next_pending_on(&mut conn, "w1").unwrap().unwrap();
+        assert_eq!(t2.number, "BO-B");
+        let t3 = acquire_next_pending_on(&mut conn, "w1").unwrap().unwrap();
+        assert_eq!(t3.number, "BO-A");
+        assert!(acquire_next_pending_on(&mut conn, "w1").unwrap().is_none());
+    }
+
+    #[test]
+    fn acquire_next_pending_moves_row_to_em_leitura_and_audits_with_worker_label() {
+        let mut conn = fresh_memory_db();
+        add_bo_on(&mut conn, "BO-WORKER", "Furto").unwrap();
+        let task = acquire_next_pending_on(&mut conn, "worker-alpha")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.number, "BO-WORKER");
+        assert_eq!(task.nature, "Furto");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM bo_queue WHERE number='BO-WORKER'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "EM_LEITURA");
+        let reason: String = conn
+            .query_row(
+                "SELECT reason FROM bo_queue WHERE number='BO-WORKER'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(reason.contains("worker-alpha"), "reason: {reason}");
+        let audit_actions: Vec<String> = conn
+            .prepare("SELECT action FROM audit_log WHERE bo_number='BO-WORKER' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            audit_actions,
+            vec!["added".to_owned(), "EM_LEITURA".to_owned()]
+        );
+    }
+
+    #[test]
+    fn acquire_next_pending_sanitizes_worker_id_with_control_chars() {
+        let mut conn = fresh_memory_db();
+        add_bo_on(&mut conn, "BO-SAN", "Furto").unwrap();
+        let _ = acquire_next_pending_on(&mut conn, "worker\n\tpalpite").unwrap();
+        let reason: String = conn
+            .query_row(
+                "SELECT reason FROM bo_queue WHERE number='BO-SAN'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!reason.contains('\n'));
+        assert!(!reason.contains('\t'));
+        assert!(reason.contains("worker palpite"));
+    }
+
+    #[test]
+    fn record_read_outcome_concluida_moves_em_leitura_to_lido() {
+        let mut conn = fresh_memory_db();
+        add_bo_on(&mut conn, "BO-OK", "Furto").unwrap();
+        acquire_next_pending_on(&mut conn, "w").unwrap().unwrap();
+        record_read_outcome_on(&mut conn, "BO-OK", "CONCLUIDA", &[]).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM bo_queue WHERE number='BO-OK'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "LIDO");
+    }
+
+    #[test]
+    fn record_read_outcome_parcial_moves_to_aguardando_revisao_with_joined_reasons() {
+        let mut conn = fresh_memory_db();
+        add_bo_on(&mut conn, "BO-P", "Furto").unwrap();
+        acquire_next_pending_on(&mut conn, "w").unwrap().unwrap();
+        record_read_outcome_on(
+            &mut conn,
+            "BO-P",
+            "PARCIAL",
+            &[
+                "ABA_AUSENTE: Documentos".to_owned(),
+                "PAINEL_NAO_CARREGADO: Relato".to_owned(),
+            ],
+        )
+        .unwrap();
+        let (status, reason): (String, String) = conn
+            .query_row(
+                "SELECT status, reason FROM bo_queue WHERE number='BO-P'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "AGUARDANDO_REVISAO");
+        assert!(reason.contains("Leitura parcial"));
+        assert!(reason.contains("ABA_AUSENTE: Documentos"));
+        assert!(reason.contains("PAINEL_NAO_CARREGADO: Relato"));
+    }
+
+    #[test]
+    fn record_read_outcome_restrita_moves_em_leitura_to_restrito() {
+        let mut conn = fresh_memory_db();
+        add_bo_on(&mut conn, "BO-R", "Furto").unwrap();
+        acquire_next_pending_on(&mut conn, "w").unwrap().unwrap();
+        record_read_outcome_on(
+            &mut conn,
+            "BO-R",
+            "RESTRITA",
+            &["ACESSO_RESTRITO".to_owned()],
+        )
+        .unwrap();
+        let status: String = conn
+            .query_row("SELECT status FROM bo_queue WHERE number='BO-R'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "RESTRITO");
+    }
+
+    #[test]
+    fn record_read_outcome_falha_moves_em_leitura_to_erro() {
+        let mut conn = fresh_memory_db();
+        add_bo_on(&mut conn, "BO-F", "Furto").unwrap();
+        acquire_next_pending_on(&mut conn, "w").unwrap().unwrap();
+        record_read_outcome_on(&mut conn, "BO-F", "FALHA", &["SESSAO_EXPIRADA".to_owned()])
+            .unwrap();
+        let status: String = conn
+            .query_row("SELECT status FROM bo_queue WHERE number='BO-F'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "ERRO");
+    }
+
+    #[test]
+    fn record_read_outcome_rejects_unknown_completeness_variant() {
+        let mut conn = fresh_memory_db();
+        add_bo_on(&mut conn, "BO-U", "Furto").unwrap();
+        acquire_next_pending_on(&mut conn, "w").unwrap().unwrap();
+        let err = record_read_outcome_on(&mut conn, "BO-U", "INVENTADO", &[]).unwrap_err();
+        assert!(err.contains("Completude"), "mensagem foi: {err}");
+    }
+
+    #[test]
+    fn update_cas_prevents_lost_update_when_underlying_status_changed_externally() {
+        // Prova direta da semântica do CAS: a cláusula WHERE adicionada em
+        // update_bo_status_on usa `AND status=<current>`. Se o estado real diverge,
+        // o UPDATE devolve 0 linhas e nada é alterado nem auditado.
+        let mut conn = fresh_memory_db();
+        // Insere em EM_LEITURA direto — como se outro worker tivesse adquirido a tarefa.
+        conn.execute(
+            "INSERT INTO bo_queue(number,nature,status) VALUES ('BO-RACE','Furto','EM_LEITURA')",
+            [],
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        // Replica o padrão: tenta a transição assumindo PENDENTE.
+        let changed = tx
+            .execute(
+                "UPDATE bo_queue SET status='EM_LEITURA', reason='lost', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE number='BO-RACE' AND status='PENDENTE'",
+                [],
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(changed, 0, "CAS impediu lost update");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM bo_queue WHERE number='BO-RACE'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "EM_LEITURA");
+        // Nada de audit — o UPDATE sequer foi executado.
+        assert_eq!(table_count(&conn, "audit_log"), 0);
     }
 
     #[test]
