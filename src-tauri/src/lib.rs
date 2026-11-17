@@ -477,6 +477,55 @@ fn record_read_outcome(
     record_read_outcome_on(&mut conn, &number, &completeness, &reasons)
 }
 
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct SyntheticCycleResult {
+    number: String,
+    next_status: String,
+    recognized_tabs: Vec<String>,
+    is_synthetic: bool,
+}
+
+/// Executa um ciclo de leitura SINTÉTICO (sem tocar no PPE): adquire a próxima tarefa
+/// PENDENTE, finge uma leitura "CONCLUIDA" com as 9 abas padrão, e aplica o
+/// `record_read_outcome`. Serve para demonstrar o fluxo end-to-end M7 no desktop
+/// antes do worker Node real estar integrado. **Nenhuma conexão com o PPE é feita.**
+///
+/// Se não houver PENDENTE, retorna `Err` com mensagem clara.
+fn run_synthetic_cycle_on(conn: &mut Connection) -> Result<SyntheticCycleResult, String> {
+    let task = acquire_next_pending_on(conn, "desktop-synthetic")?
+        .ok_or_else(|| "Nenhum B.O. PENDENTE na fila para simular.".to_owned())?;
+    // Reusa a lista canônica de abas do contrato PPE (replicada aqui porque Rust não
+    // compartilha o mesmo módulo JS — mas é a mesma lista de READ_ONLY_TABS).
+    let recognized_tabs: Vec<String> = [
+        "Dados do Registro",
+        "Dados do Fato",
+        "Envolvidos",
+        "Vínculos",
+        "Objetos",
+        "Relato/Histórico",
+        "Documentos",
+        "Histórico",
+        "Despachos",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    record_read_outcome_on(conn, &task.number, "CONCLUIDA", &[])?;
+    Ok(SyntheticCycleResult {
+        number: task.number,
+        next_status: "LIDO".to_owned(),
+        recognized_tabs,
+        is_synthetic: true,
+    })
+}
+
+#[tauri::command]
+fn desktop_run_synthetic_cycle(app: AppHandle) -> Result<SyntheticCycleResult, String> {
+    let mut conn = connection(&app)?;
+    run_synthetic_cycle_on(&mut conn)
+}
+
 #[tauri::command]
 fn open_sinesp_portal() -> Result<(), String> {
     // Open a fixed official URL in the default browser. Credentials never pass through SIED.
@@ -505,6 +554,7 @@ pub fn run() {
             update_bo_status,
             acquire_next_pending,
             record_read_outcome,
+            desktop_run_synthetic_cycle,
             open_sinesp_portal
         ])
         .run(tauri::generate_context!())
@@ -1233,6 +1283,32 @@ mod tests {
         assert_eq!(status, "EM_LEITURA");
         // Nada de audit — o UPDATE sequer foi executado.
         assert_eq!(table_count(&conn, "audit_log"), 0);
+    }
+
+    #[test]
+    fn run_synthetic_cycle_moves_a_pendente_to_lido_and_returns_number() {
+        let mut conn = fresh_memory_db();
+        add_bo_on(&mut conn, "BO-SYN", "Furto").unwrap();
+        let result = run_synthetic_cycle_on(&mut conn).unwrap();
+        assert_eq!(result.number, "BO-SYN");
+        assert_eq!(result.next_status, "LIDO");
+        assert_eq!(result.recognized_tabs.len(), 9);
+        assert!(result.is_synthetic);
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM bo_queue WHERE number='BO-SYN'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "LIDO");
+    }
+
+    #[test]
+    fn run_synthetic_cycle_without_pendente_returns_clear_error() {
+        let mut conn = fresh_memory_db();
+        let err = run_synthetic_cycle_on(&mut conn).unwrap_err();
+        assert!(err.contains("Nenhum B.O. PENDENTE"), "mensagem: {err}");
     }
 
     #[test]

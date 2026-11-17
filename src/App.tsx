@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Activity, ArrowLeft, ArrowRight, CalendarClock, Check, CheckCheck, ChevronDown, CircleHelp, Clock3, FileClock, FileText, Fingerprint, Gauge, LockKeyhole, Pause, Play, RotateCcw, Scale, Search, Settings2, Shield, ShieldCheck, SlidersHorizontal, Sparkles, X, AlertTriangle, BarChart3 } from 'lucide-react';
 import { JusticeLogo } from './components/JusticeLogo';
-import { addLocalBo, desktopAvailable, openOfficialPortal, runLocalQueueTest, updateLocalBo } from './services.local';
+import { addLocalBo, desktopAvailable, openOfficialPortal, runDesktopSyntheticCycle, runLocalQueueTest, updateLocalBo } from './services.local';
 import type { LocalBo, QueueSummary } from './services.local';
 import { toDashboardMetrics } from './queue/summary.mjs';
 import { toUserError } from './services/errors.mjs';
@@ -145,7 +145,15 @@ function App() {
       return;
     }
     if (desktopAvailable) {
-      setToast('Worker de leitura do PPE ainda não integrado (marco M7). Use "npm run ppe:inspecionar" para a sessão assistida.');
+      setLocalError('');
+      try {
+        const result = await runDesktopSyntheticCycle();
+        setLastActivity(`Ciclo sintético concluído: ${result.number} → ${result.nextStatus}`);
+        setToast(`Simulação sintética local: ${result.number} marcado como LIDO (${result.recognizedTabs.length} abas). Nenhuma leitura do PPE real foi feita.`);
+        queue.refresh();
+      } catch (error) {
+        setLocalError(toUserError(error, 'Falha ao executar o ciclo sintético.'));
+      }
       return;
     }
 

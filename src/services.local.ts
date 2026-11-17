@@ -98,3 +98,15 @@ export async function openOfficialPortal(): Promise<void> {
   if (!desktopAvailable) throw new Error('Abra o aplicativo desktop para iniciar a sessão oficial.');
   await invoke('open_sinesp_portal');
 }
+
+export type SyntheticCycleResult = {
+  number: string;
+  nextStatus: string;
+  recognizedTabs: string[];
+  isSynthetic: boolean;
+};
+
+export async function runDesktopSyntheticCycle(): Promise<SyntheticCycleResult> {
+  if (!desktopAvailable) throw new Error('Ciclo sintético desktop requer o aplicativo nativo.');
+  return invoke<SyntheticCycleResult>('desktop_run_synthetic_cycle');
+}
