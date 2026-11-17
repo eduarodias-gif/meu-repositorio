@@ -110,3 +110,60 @@ export async function runDesktopSyntheticCycle(): Promise<SyntheticCycleResult> 
   if (!desktopAvailable) throw new Error('Ciclo sintético desktop requer o aplicativo nativo.');
   return invoke<SyntheticCycleResult>('desktop_run_synthetic_cycle');
 }
+
+// --- IA LOCAL (M8 integração) ---
+// Nenhuma dessas funções chama serviço externo. Toda chamada é validada como
+// loopback no backend Rust; redirects HTTP são rejeitados.
+
+export type OllamaEndpointConfig = {
+  host: string;
+  port: number;
+  timeoutSeconds?: number;
+};
+
+export type AnalysisRequest = {
+  boNumber: string;
+  model: string;
+  promptVersionId: string;
+  promptBody: string;
+  readingHash: string;
+  readingPayload: string;
+};
+
+export type AnalysisResult = {
+  boNumber: string;
+  model: string;
+  promptVersionId: string;
+  readingHash: string;
+  classificacao: string;
+  fatos: string[];
+  justificativa: string;
+  fundamentos: string[];
+  lacunas: string[];
+  alertas: string[];
+  minuta: string;
+  minutaCharCount: number;
+  minutaOverflow: boolean;
+};
+
+export type PromptHashResult = { sha256Hex: string; charCount: number };
+
+const DEFAULT_OLLAMA: OllamaEndpointConfig = { host: '127.0.0.1', port: 11434, timeoutSeconds: 30 };
+
+export async function listOllamaModels(endpoint: OllamaEndpointConfig = DEFAULT_OLLAMA): Promise<string[]> {
+  if (!desktopAvailable) throw new Error('IA local requer o aplicativo desktop.');
+  return invoke<string[]>('ai_list_models', { endpoint });
+}
+
+export async function runOllamaAnalysis(
+  request: AnalysisRequest,
+  endpoint: OllamaEndpointConfig = DEFAULT_OLLAMA,
+): Promise<AnalysisResult> {
+  if (!desktopAvailable) throw new Error('IA local requer o aplicativo desktop.');
+  return invoke<AnalysisResult>('ai_run_analysis', { endpoint, request });
+}
+
+export async function hashPromptBody(body: string): Promise<PromptHashResult> {
+  if (!desktopAvailable) throw new Error('Hash do prompt requer o aplicativo desktop.');
+  return invoke<PromptHashResult>('ai_hash_prompt_body', { body });
+}

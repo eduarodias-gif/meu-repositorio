@@ -527,6 +527,131 @@ fn desktop_run_synthetic_cycle(app: AppHandle) -> Result<SyntheticCycleResult, S
     run_synthetic_cycle_on(&mut conn)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiEndpointInput {
+    host: String,
+    port: u16,
+    #[serde(default = "default_timeout_seconds")]
+    timeout_seconds: u64,
+}
+
+fn default_timeout_seconds() -> u64 {
+    30
+}
+
+impl AiEndpointInput {
+    fn into_endpoint(self) -> ai::OllamaEndpoint {
+        ai::OllamaEndpoint {
+            host: self.host,
+            port: self.port,
+            timeout: std::time::Duration::from_secs(self.timeout_seconds.max(1)),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiAnalysisRequestInput {
+    bo_number: String,
+    model: String,
+    prompt_version_id: String,
+    prompt_body: String,
+    reading_hash: String,
+    reading_payload: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiAnalysisResultOutput {
+    bo_number: String,
+    model: String,
+    prompt_version_id: String,
+    reading_hash: String,
+    classificacao: String,
+    fatos: Vec<String>,
+    justificativa: String,
+    fundamentos: Vec<String>,
+    lacunas: Vec<String>,
+    alertas: Vec<String>,
+    minuta: String,
+    minuta_char_count: usize,
+    minuta_overflow: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptHashOutput {
+    sha256_hex: String,
+    char_count: usize,
+}
+
+/// Lista modelos Ollama locais via GET /api/tags. Endpoint precisa ser loopback.
+#[tauri::command]
+fn ai_list_models(endpoint: AiEndpointInput) -> Result<Vec<String>, String> {
+    let ep = endpoint.into_endpoint();
+    ai::list_local_models(&ep)
+}
+
+/// Executa uma análise completa via POST /api/chat. NUNCA chama serviço externo —
+/// o endpoint precisa ser loopback (validação em ai.rs). O caller é responsável por
+/// ter instalado Ollama localmente E por ter escolhido um modelo adequado.
+#[tauri::command]
+fn ai_run_analysis(
+    endpoint: AiEndpointInput,
+    request: AiAnalysisRequestInput,
+) -> Result<AiAnalysisResultOutput, String> {
+    let ep = endpoint.into_endpoint();
+    // Validações defensivas antes de bater na rede.
+    let number = clean_number(&request.bo_number)?;
+    if request.model.trim().is_empty() {
+        return Err("Modelo vazio.".to_owned());
+    }
+    if request.prompt_version_id.trim().is_empty() {
+        return Err("prompt_version_id vazio.".to_owned());
+    }
+    if request.prompt_body.trim().is_empty() {
+        return Err("prompt_body vazio.".to_owned());
+    }
+    if request.reading_hash.trim().is_empty() {
+        return Err("reading_hash vazio.".to_owned());
+    }
+    let req = ai::AnalysisRequest {
+        bo_number: number,
+        model: request.model,
+        prompt_version_id: request.prompt_version_id,
+        prompt_body: request.prompt_body,
+        reading_hash: request.reading_hash,
+        reading_payload: request.reading_payload,
+    };
+    let result = ai::run_analysis(&ep, &req)?;
+    Ok(AiAnalysisResultOutput {
+        bo_number: result.bo_number,
+        model: result.model,
+        prompt_version_id: result.prompt_version_id,
+        reading_hash: result.reading_hash,
+        classificacao: result.raw.classificacao,
+        fatos: result.raw.fatos,
+        justificativa: result.raw.justificativa,
+        fundamentos: result.raw.fundamentos,
+        lacunas: result.raw.lacunas,
+        alertas: result.raw.alertas,
+        minuta: result.raw.minuta,
+        minuta_char_count: result.minuta_char_count,
+        minuta_overflow: result.minuta_overflow,
+    })
+}
+
+/// Devolve o SHA-256 em hex de um corpo de prompt. Caller (UI de edição)
+/// usa como `prompt_version_id` estável que vincula uma análise a uma versão.
+#[tauri::command]
+fn ai_hash_prompt_body(body: String) -> Result<PromptHashOutput, String> {
+    Ok(PromptHashOutput {
+        sha256_hex: ai::hash_prompt_body(&body),
+        char_count: body.chars().count(),
+    })
+}
+
 #[tauri::command]
 fn open_sinesp_portal() -> Result<(), String> {
     // Open a fixed official URL in the default browser. Credentials never pass through SIED.
@@ -556,6 +681,9 @@ pub fn run() {
             acquire_next_pending,
             record_read_outcome,
             desktop_run_synthetic_cycle,
+            ai_list_models,
+            ai_run_analysis,
+            ai_hash_prompt_body,
             open_sinesp_portal
         ])
         .run(tauri::generate_context!())
