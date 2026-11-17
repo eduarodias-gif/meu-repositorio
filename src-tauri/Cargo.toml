@@ -1,0 +1,23 @@
+[package]
+name = "sied-system-v5"
+version = "0.4.0"
+description = "SIED SYSTEM V5 local operational foundation"
+authors = ["SIED SYSTEM"]
+license = "MIT"
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "sied_system_v5_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

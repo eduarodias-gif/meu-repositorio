@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.superpowers/
+src-tauri/target/
+src-tauri/gen/schemas/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store

@@ -1,0 +1,100 @@
+import { invoke, isTauri } from '@tauri-apps/api/core';
+import { createBrowserQueue } from './queue/browser-store.mjs';
+import { processQueueRows } from './worker/queue-processor.mjs';
+import type { QueueProcessorResult } from './worker/queue-processor.mjs';
+
+export type LocalBo = {
+  number: string;
+  nature: string;
+  status: QueueStatus;
+  reason: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type QueueStatus =
+  | 'PENDENTE'
+  | 'EM_LEITURA'
+  | 'LIDO'
+  | 'EM_ANALISE'
+  | 'MINUTA_GERADA'
+  | 'AGUARDANDO_REVISAO'
+  | 'VALIDADO_PELO_RESPONSAVEL'
+  | 'AGUARDANDO_FINALIZACAO'
+  | 'CONCLUIDO_VERIFICADO'
+  | 'ERRO'
+  | 'RESTRITO';
+
+export type QueueSummary = {
+  queue: number;
+  completed: number;
+  review: number;
+  errors: number;
+  restricted: number;
+  total: number;
+};
+
+export type QueueSnapshot = {
+  rows: LocalBo[];
+  summary: QueueSummary;
+  revision: number;
+};
+
+export const desktopAvailable = isTauri();
+const browserQueue = !desktopAvailable && typeof window !== 'undefined'
+  ? createBrowserQueue(window.localStorage)
+  : null;
+
+export async function listLocalBos(): Promise<LocalBo[]> {
+  if (!desktopAvailable) return browserQueue?.list() as LocalBo[] ?? [];
+  return invoke<LocalBo[]>('list_bos');
+}
+export async function getQueueSummary(): Promise<QueueSummary> {
+  if (!desktopAvailable) return browserQueue?.summary() ?? { queue: 0, completed: 0, review: 0, errors: 0, restricted: 0, total: 0 };
+  return invoke<QueueSummary>('queue_summary');
+}
+export async function getQueueSnapshot(): Promise<QueueSnapshot> {
+  if (!desktopAvailable) {
+    const rows = (browserQueue?.list() as LocalBo[]) ?? [];
+    const summary = browserQueue?.summary() ?? { queue: 0, completed: 0, review: 0, errors: 0, restricted: 0, total: 0 };
+    const revision = browserQueue?.audit().length ?? 0;
+    return { rows, summary, revision };
+  }
+  return invoke<QueueSnapshot>('queue_snapshot');
+}
+export async function addLocalBo(number: string, nature: string): Promise<LocalBo[]> {
+  if (!desktopAvailable) return browserQueue?.add(number, nature) as LocalBo[] ?? [];
+  return invoke<LocalBo[]>('add_bo', { number, nature });
+}
+export async function updateLocalBo(number: string, status: LocalBo['status'], reason = ''): Promise<LocalBo[]> {
+  if (!desktopAvailable) return browserQueue?.update(number, status, reason) as LocalBo[] ?? [];
+  return invoke<LocalBo[]>('update_bo_status', { number, status, reason });
+}
+export async function runLocalQueueTest(options: {
+  signal?: AbortSignal;
+  onProgress?: (event: Record<string, string>) => void;
+} = {}): Promise<QueueProcessorResult> {
+  if (desktopAvailable) {
+    throw new Error('O teste local do navegador não substitui a sessão PPE do aplicativo desktop.');
+  }
+  const rows = (await listLocalBos()).filter(row => row.status === 'PENDENTE' && /^TESTE-/i.test(row.number));
+  if (rows.length === 0) {
+    throw new Error('Cadastre um B.O. fictício começando com TESTE- para executar o fluxo local.');
+  }
+  return processQueueRows(rows, {
+    signal: options.signal,
+    onProgress: options.onProgress,
+    readBo: async () => ({
+      completeness: 'CONCLUIDA',
+      recognizedTabs: ['Dados do Registro', 'Dados do Fato'],
+      reasons: [],
+    }),
+    updateStatus: async (number, status, reason) => {
+      await updateLocalBo(number, status as QueueStatus, reason);
+    },
+  });
+}
+export async function openOfficialPortal(): Promise<void> {
+  if (!desktopAvailable) throw new Error('Abra o aplicativo desktop para iniciar a sessão oficial.');
+  await invoke('open_sinesp_portal');
+}
