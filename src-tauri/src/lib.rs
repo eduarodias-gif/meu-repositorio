@@ -5,6 +5,7 @@ use tauri::{AppHandle, Manager};
 
 mod ai;
 mod sanitize;
+mod scheduler;
 mod security;
 mod storage;
 
