@@ -167,3 +167,61 @@ export async function hashPromptBody(body: string): Promise<PromptHashResult> {
   if (!desktopAvailable) throw new Error('Hash do prompt requer o aplicativo desktop.');
   return invoke<PromptHashResult>('ai_hash_prompt_body', { body });
 }
+
+// --- AGENDAMENTO (M11 iteração 2) ---
+// A configuração é persistida em %APPDATA%\br.sied.systemv5\config\schedule.json
+// em texto plano (preferências não são sensíveis — o usuário precisa poder
+// inspecionar sem o app rodar). Sempre valida antes de gravar.
+
+export type ScheduleConfig = {
+  enabled: boolean;
+  daysOfWeek: number[]; // 0=Dom..6=Sáb
+  startMinuteOfDay: number; // 0..1439
+  endMinuteOfDay: number; // 0..1439
+  maxTasksPerWindow: number;
+};
+
+export type WindowReason =
+  | 'DISABLED'
+  | 'DAY_NOT_SELECTED'
+  | 'BEFORE_WINDOW'
+  | 'AFTER_WINDOW'
+  | 'TASKS_CAP_REACHED'
+  | 'IN_WINDOW'
+  | 'INVALID_CONFIG';
+
+export type WindowStatus = {
+  allowedToAcquire: boolean;
+  inWindow: boolean;
+  reason: WindowReason;
+  tasksDoneInWindow: number;
+  maxTasksPerWindow: number;
+};
+
+export async function getScheduleConfig(): Promise<ScheduleConfig> {
+  if (!desktopAvailable) throw new Error('Agendamento persistido só no desktop.');
+  return invoke<ScheduleConfig>('get_schedule_config');
+}
+
+export async function setScheduleConfig(config: ScheduleConfig): Promise<ScheduleConfig> {
+  if (!desktopAvailable) throw new Error('Agendamento persistido só no desktop.');
+  return invoke<ScheduleConfig>('set_schedule_config', { config });
+}
+
+export async function checkScheduleWindow(at: {
+  nowDow: number;
+  nowMinuteOfDay: number;
+  tasksDoneInWindow: number;
+}): Promise<WindowStatus> {
+  if (!desktopAvailable) throw new Error('Checagem de janela só no desktop.');
+  return invoke<WindowStatus>('check_schedule_window', { at });
+}
+
+export function currentWindowInput(tasksDoneInWindow = 0) {
+  const now = new Date();
+  return {
+    nowDow: now.getDay(),
+    nowMinuteOfDay: now.getHours() * 60 + now.getMinutes(),
+    tasksDoneInWindow,
+  };
+}

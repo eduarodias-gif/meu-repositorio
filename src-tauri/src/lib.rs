@@ -653,6 +653,46 @@ fn ai_hash_prompt_body(body: String) -> Result<PromptHashOutput, String> {
 }
 
 #[tauri::command]
+fn get_schedule_config(app: AppHandle) -> Result<scheduler::ScheduleConfig, String> {
+    let root = storage::app_data_root(&app)?;
+    scheduler::load_config(&root)
+}
+
+#[tauri::command]
+fn set_schedule_config(
+    app: AppHandle,
+    config: scheduler::ScheduleConfig,
+) -> Result<scheduler::ScheduleConfig, String> {
+    config.validate()?;
+    let root = storage::app_data_root(&app)?;
+    scheduler::save_config(&root, &config)?;
+    scheduler::load_config(&root)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowCheckInput {
+    now_dow: u32,
+    now_minute_of_day: u32,
+    tasks_done_in_window: u32,
+}
+
+#[tauri::command]
+fn check_schedule_window(
+    app: AppHandle,
+    at: WindowCheckInput,
+) -> Result<scheduler::WindowStatus, String> {
+    let root = storage::app_data_root(&app)?;
+    let cfg = scheduler::load_config(&root)?;
+    Ok(scheduler::window_status(
+        &cfg,
+        at.now_dow,
+        at.now_minute_of_day,
+        at.tasks_done_in_window,
+    ))
+}
+
+#[tauri::command]
 fn open_sinesp_portal() -> Result<(), String> {
     // Open a fixed official URL in the default browser. Credentials never pass through SIED.
     #[cfg(target_os = "windows")]
@@ -684,6 +724,9 @@ pub fn run() {
             ai_list_models,
             ai_run_analysis,
             ai_hash_prompt_body,
+            get_schedule_config,
+            set_schedule_config,
+            check_schedule_window,
             open_sinesp_portal
         ])
         .run(tauri::generate_context!())

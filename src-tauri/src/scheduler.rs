@@ -107,6 +107,32 @@ fn previous_dow(dow: u32) -> u32 {
     (dow + 6) % 7
 }
 
+pub const CONFIG_SUBPATH: &str = "config/schedule.json";
+
+/// Serializa `config` como JSON pretty e grava em `root/config/schedule.json`
+/// via `storage::write_plain`. Falha se a config não valida.
+pub fn save_config(root: &std::path::Path, config: &ScheduleConfig) -> Result<(), String> {
+    config.validate()?;
+    let bytes = serde_json::to_vec_pretty(config)
+        .map_err(|err| format!("Falha ao serializar schedule: {err}"))?;
+    super::storage::write_plain(root, CONFIG_SUBPATH, &bytes)
+}
+
+/// Lê `root/config/schedule.json`. Se o arquivo não existir, devolve
+/// `ScheduleConfig::default_disabled()`. Qualquer JSON inválido retorna erro
+/// claro, sem silenciosamente trocar por default — a camada superior decide
+/// se migra automaticamente ou devolve o erro ao usuário.
+pub fn load_config(root: &std::path::Path) -> Result<ScheduleConfig, String> {
+    if !super::storage::exists_within(root, CONFIG_SUBPATH)? {
+        return Ok(ScheduleConfig::default_disabled());
+    }
+    let bytes = super::storage::read_plain(root, CONFIG_SUBPATH)?;
+    let cfg: ScheduleConfig =
+        serde_json::from_slice(&bytes).map_err(|err| format!("schedule.json inválido: {err}"))?;
+    cfg.validate()?;
+    Ok(cfg)
+}
+
 pub fn window_status(
     config: &ScheduleConfig,
     now_dow: u32,
@@ -417,6 +443,71 @@ mod tests {
         assert_eq!(bad_dow.reason, WindowReason::InvalidConfig);
         let bad_minute = window_status(&cfg, MON, MINUTES_PER_DAY, 0);
         assert_eq!(bad_minute.reason, WindowReason::InvalidConfig);
+    }
+
+    fn tmp_root(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static C: AtomicU64 = AtomicU64::new(0);
+        let id = C.fetch_add(1, Ordering::SeqCst);
+        let p =
+            std::env::temp_dir().join(format!("sied-m11p-{}-{}-{}", std::process::id(), tag, id));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn load_config_returns_default_disabled_when_file_missing() {
+        let root = tmp_root("load-missing");
+        let cfg = load_config(&root).unwrap();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg, ScheduleConfig::default_disabled());
+    }
+
+    #[test]
+    fn save_then_load_round_trips_config() {
+        let root = tmp_root("rt");
+        let cfg = ScheduleConfig {
+            enabled: true,
+            days_of_week: vec![MON, TUE, FRI],
+            start_minute_of_day: h(9, 0),
+            end_minute_of_day: h(17, 0),
+            max_tasks_per_window: 42,
+        };
+        save_config(&root, &cfg).unwrap();
+        let loaded = load_config(&root).unwrap();
+        assert_eq!(loaded, cfg);
+    }
+
+    #[test]
+    fn save_rejects_invalid_config_before_writing_file() {
+        let root = tmp_root("invalid");
+        let cfg = ScheduleConfig {
+            enabled: true,
+            days_of_week: vec![MON],
+            start_minute_of_day: h(10, 0),
+            end_minute_of_day: h(10, 0), // start == end
+            max_tasks_per_window: 50,
+        };
+        let err = save_config(&root, &cfg).unwrap_err();
+        assert!(err.contains("nula"), "msg: {err}");
+        assert!(!super::super::storage::exists_within(&root, CONFIG_SUBPATH).unwrap());
+    }
+
+    #[test]
+    fn load_config_rejects_malformed_json_without_falling_back_to_default() {
+        let root = tmp_root("bad-json");
+        super::super::storage::write_plain(&root, CONFIG_SUBPATH, b"{ not json").unwrap();
+        let err = load_config(&root).unwrap_err();
+        assert!(err.contains("inválido"), "msg: {err}");
+    }
+
+    #[test]
+    fn load_config_rejects_well_formed_json_that_fails_validation() {
+        let root = tmp_root("valid-json-invalid-cfg");
+        let bytes = br#"{"enabled":true,"daysOfWeek":[7],"startMinuteOfDay":600,"endMinuteOfDay":720,"maxTasksPerWindow":10}"#;
+        super::super::storage::write_plain(&root, CONFIG_SUBPATH, bytes).unwrap();
+        let err = load_config(&root).unwrap_err();
+        assert!(err.contains("dayOfWeek"), "msg: {err}");
     }
 
     #[test]

@@ -97,6 +97,33 @@ pub fn list_within(root: &Path, subpath: &str) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
+/// Escreve `bytes` em texto plano em `root/subpath`. Cria diretórios pai sob demanda.
+/// Use para **configuração e preferências** (horários, filtros, flags) que não são
+/// sensíveis e que o usuário precisa conseguir inspecionar sem o app rodar.
+/// Para conteúdo sensível (relato, minuta, hash de sessão), use `secure_write`.
+pub fn write_plain(root: &Path, subpath: &str, bytes: &[u8]) -> Result<(), String> {
+    let path = resolve_within(root, subpath)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes).map_err(|err| err.to_string())?;
+    fs::rename(&tmp, &path).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+/// Lê um arquivo plain em `root/subpath`. Falha se o arquivo não existir.
+pub fn read_plain(root: &Path, subpath: &str) -> Result<Vec<u8>, String> {
+    let path = resolve_within(root, subpath)?;
+    fs::read(&path).map_err(|err| err.to_string())
+}
+
+/// Retorna `true` se o arquivo em `root/subpath` existe.
+pub fn exists_within(root: &Path, subpath: &str) -> Result<bool, String> {
+    let path = resolve_within(root, subpath)?;
+    Ok(path.exists())
+}
+
 /// Remove um arquivo ou diretório (recursivo) dentro de `root/subpath`.
 /// Segurança: só opera sob o root já validado.
 pub fn delete_within(root: &Path, subpath: &str) -> Result<(), String> {
@@ -229,6 +256,37 @@ mod tests {
     fn delete_within_noop_for_missing_file() {
         let root = temp_root("delete-noop");
         delete_within(&root, "inexistente.bin").unwrap();
+    }
+
+    #[test]
+    fn write_plain_round_trips_bytes_and_cleans_tmp() {
+        let root = temp_root("plain-rw");
+        let payload = b"{\"a\":1}";
+        write_plain(&root, "conf/schedule.json", payload).unwrap();
+        let got = read_plain(&root, "conf/schedule.json").unwrap();
+        assert_eq!(got, payload.to_vec());
+        // Nada de .tmp residual
+        let residuais: Vec<_> = fs::read_dir(root.join("conf"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(residuais.is_empty());
+    }
+
+    #[test]
+    fn exists_within_returns_false_for_missing_and_true_for_present() {
+        let root = temp_root("plain-exists");
+        assert!(!exists_within(&root, "x.json").unwrap());
+        write_plain(&root, "x.json", b"{}").unwrap();
+        assert!(exists_within(&root, "x.json").unwrap());
+    }
+
+    #[test]
+    fn write_plain_rejects_dotdot_escape() {
+        let root = temp_root("plain-escape");
+        let err = write_plain(&root, "../out.json", b"x").unwrap_err();
+        assert!(err.contains("`..`"));
     }
 
     #[test]
